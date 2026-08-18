@@ -32,6 +32,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import time
 
 import requests
@@ -43,10 +44,20 @@ app = Flask(__name__)
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 ARIA2_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aria2-daemon.log")
 
+import platform
+
+
+def _default_save_dir():
+    """跨平台默认保存目录：Windows 用用户的下载文件夹，Linux/NAS 用 /vol1"""
+    if platform.system() == "Windows":
+        return os.path.join(os.path.expanduser("~"), "Downloads", "HF-Models")
+    return "/vol1/1000/download"
+
+
 DEFAULT_CONFIG = {
     "rpc_url": "http://127.0.0.1:6801/jsonrpc",  # 本工具自建的独立 aria2 实例，跟 Trim 的 6800 分开
     "rpc_secret": "",  # 首次启动自动生成，不用手动填
-    "save_dir": "/vol1/1000/download",
+    "save_dir": _default_save_dir(),
     "connections_per_file": 16,  # aria2 单文件最大连接数，1-16
 }
 
@@ -142,6 +153,29 @@ def is_aria2_daemon_alive(cfg) -> bool:
         return False
 
 
+def _find_aria2_executable():
+    """
+    找 aria2c 可执行文件：
+    1. 先看 PATH 里有没有（Linux 装了 apt install aria2 就在这）
+    2. 再看程序自身所在目录（打包成 exe 时可以把 aria2c.exe 放在同一个文件夹）
+    """
+    import shutil as _shutil
+
+    exe_name = "aria2c.exe" if platform.system() == "Windows" else "aria2c"
+
+    found = _shutil.which(exe_name)
+    if found:
+        return found
+
+    # PyInstaller 打包后，用 sys._MEIPASS 或 sys.executable 所在目录
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)))
+    local_path = os.path.join(base_dir, exe_name)
+    if os.path.exists(local_path):
+        return local_path
+
+    return exe_name  # 找不到就原样返回，让 subprocess 报 FileNotFoundError
+
+
 def ensure_aria2_daemon(cfg):
     """
     检查本工具专属的 aria2c RPC 守护进程是否在跑，
@@ -156,7 +190,7 @@ def ensure_aria2_daemon(cfg):
     os.makedirs(cfg["save_dir"], exist_ok=True)
 
     cmd = [
-        "aria2c",
+        _find_aria2_executable(),
         "--enable-rpc",
         "--rpc-listen-all=false",  # 只监听本机，不对外网暴露
         f"--rpc-listen-port={port}",
@@ -168,12 +202,24 @@ def ensure_aria2_daemon(cfg):
     ]
 
     log_f = open(ARIA2_LOG_FILE, "a", encoding="utf-8")
-    _aria2_daemon_process = subprocess.Popen(
-        cmd,
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    popen_kwargs = {"stdout": log_f, "stderr": subprocess.STDOUT}
+    if platform.system() == "Windows":
+        # Windows 没有 start_new_session，用 CREATE_NO_WINDOW 避免弹出黑窗口
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        _aria2_daemon_process = subprocess.Popen(cmd, **popen_kwargs)
+    except FileNotFoundError:
+        log_f.write(
+            "\n[启动失败] 找不到 aria2c 可执行文件。\n"
+            "Windows: 请下载 aria2 (https://github.com/aria2/aria2/releases)，\n"
+            "解压后把 aria2c.exe 所在目录加入系统 PATH，或者放进本程序同一目录下。\n"
+            "Linux: 请运行 apt install aria2 -y（或对应发行版的包管理器）。\n"
+        )
+        log_f.close()
+        return False
 
     # 等待 RPC 端口起来，最多等 5 秒
     for _ in range(10):
@@ -495,11 +541,11 @@ async function refreshStatus() {
   }
 }
 
-let browseCurrentPath = '/vol1';
+let browseCurrentPath = '';
 
 async function openBrowseModal() {
   document.getElementById('browseModal').style.display = 'block';
-  const startPath = document.getElementById('saveDir').value.trim() || '/vol1';
+  const startPath = document.getElementById('saveDir').value.trim();
   await loadBrowseDir(startPath);
 }
 
@@ -512,20 +558,27 @@ async function loadBrowseDir(path) {
     const res = await fetch('/api/browse?path=' + encodeURIComponent(path));
     const data = await res.json();
     if (data.error) {
-      // 路径无效时退回到根目录
-      if (path !== '/') { await loadBrowseDir('/'); return; }
+      // 路径无效时退回到根目录（空字符串让后端决定：Linux 是 /，Windows 是盘符列表）
+      if (path !== '') { await loadBrowseDir(''); return; }
       document.getElementById('browseList').innerHTML = '<div class="muted">' + data.error + '</div>';
       return;
     }
-    browseCurrentPath = data.path;
-    document.getElementById('browseCurrentPath').textContent = data.path;
+    browseCurrentPath = data.is_drive_list ? '' : data.path;
+    document.getElementById('browseCurrentPath').textContent = data.is_drive_list ? '选择磁盘' : data.path;
     let html = '';
     if (data.parent) {
-      html += `<div style="padding:6px; cursor:pointer; color:#2b7de9;" onclick="loadBrowseDir('${data.parent.replace(/'/g, "\\'")}')">.. (上一级)</div>`;
+      html += `<div style="padding:6px; cursor:pointer; color:#2b7de9;" onclick="loadBrowseDir('${data.parent.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')">.. (上一级)</div>`;
     }
     data.dirs.forEach(d => {
-      const full = (data.path.endsWith('/') ? data.path : data.path + '/') + d;
-      html += `<div style="padding:6px; cursor:pointer;" onclick="loadBrowseDir('${full.replace(/'/g, "\\'")}')">📁 ${d}</div>`;
+      let full, label;
+      if (data.is_drive_list) {
+        full = d;       // Windows 盘符本身就是完整路径，如 "C:\"
+        label = d;
+      } else {
+        full = (data.path.endsWith('/') || data.path.endsWith('\\')) ? data.path + d : data.path + '/' + d;
+        label = d;
+      }
+      html += `<div style="padding:6px; cursor:pointer;" onclick="loadBrowseDir('${full.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')">📁 ${label}</div>`;
     });
     if (!data.dirs.length && !data.parent) {
       html += '<div class="muted" style="padding:6px;">（没有子目录）</div>';
@@ -537,6 +590,10 @@ async function loadBrowseDir(path) {
 }
 
 function selectCurrentBrowseDir() {
+  if (!browseCurrentPath) {
+    alert('请先点击进入一个具体的文件夹，再选择');
+    return;
+  }
   document.getElementById('saveDir').value = browseCurrentPath;
   closeBrowseModal();
 }
@@ -635,16 +692,29 @@ def api_settings():
 def api_browse():
     """
     列出指定路径下的子目录，供前端"浏览目录"弹窗使用。
-    允许浏览整个文件系统（方便跳转到 /vol1、/vol2 等不同存储卷），
-    只屏蔽几个 Linux 系统虚拟目录，避免误选到无意义的路径。
+    Linux/NAS：从 / 根目录开始，屏蔽几个系统虚拟目录。
+    Windows：path 为空或 "ROOT" 时返回所有盘符（C:\\、D:\\ 等）供选择。
     """
+    is_windows = platform.system() == "Windows"
     BLOCKED_PREFIXES = ("/proc", "/sys", "/dev", "/run")
 
-    path = request.args.get("path", "/").strip() or "/"
-    path = os.path.normpath(path)
+    raw_path = request.args.get("path", "").strip()
 
-    if any(path == p or path.startswith(p + "/") for p in BLOCKED_PREFIXES):
-        path = "/"
+    # Windows 下的"根目录"是盘符列表，不是单个路径
+    if is_windows and (not raw_path or raw_path == "ROOT"):
+        import string
+        drives = []
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.exists(drive):
+                drives.append(drive)
+        return jsonify({"path": "ROOT", "parent": None, "dirs": drives, "is_drive_list": True})
+
+    path = raw_path or ("/" if not is_windows else "ROOT")
+    if not is_windows:
+        path = os.path.normpath(path)
+        if any(path == p or path.startswith(p + "/") for p in BLOCKED_PREFIXES):
+            path = "/"
 
     if not os.path.isdir(path):
         return jsonify({"error": f"目录不存在: {path}"}), 400
@@ -655,7 +725,14 @@ def api_browse():
             full = os.path.join(path, name)
             if os.path.isdir(full) and not name.startswith("."):
                 entries.append(name)
-        parent = os.path.dirname(path) if path != "/" else None
+
+        if is_windows:
+            # 盘符根目录（如 C:\）的上一级是"返回盘符列表"
+            is_drive_root = len(path) <= 3 and path[1:3] in (":\\", ":/")
+            parent = "ROOT" if is_drive_root else os.path.dirname(path)
+        else:
+            parent = os.path.dirname(path) if path != "/" else None
+
         return jsonify({"path": path, "parent": parent, "dirs": entries})
     except PermissionError:
         return jsonify({"error": "没有权限访问该目录"}), 403
@@ -666,4 +743,11 @@ def api_browse():
 if __name__ == "__main__":
     _startup_cfg = ensure_secret(load_config())
     ensure_aria2_daemon(_startup_cfg)
+
+    # 打包成 exe 双击运行时，自动打开浏览器，不用用户自己去输网址
+    if getattr(sys, "frozen", False):
+        import threading
+        import webbrowser
+        threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:5678")).start()
+
     app.run(host="0.0.0.0", port=5678, debug=False)
