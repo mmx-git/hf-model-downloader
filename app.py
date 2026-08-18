@@ -297,7 +297,7 @@ def aria2_status_summary(cfg=None):
 
 # ========== 路由 ==========
 
-INDEX_HTML = """
+INDEX_HTML = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
