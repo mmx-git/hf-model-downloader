@@ -1,0 +1,15 @@
+[Unit]
+Description=HuggingFace Model Downloader Web Tool
+After=network.target
+
+[Service]
+Type=simple
+# 如果你把 app.py 放在别的路径，记得把下面两行的路径也改掉
+WorkingDirectory=/root/hf-downloader
+ExecStart=/usr/bin/python3 /root/hf-downloader/app.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

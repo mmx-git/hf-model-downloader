@@ -1,0 +1,15 @@
+# 运行时生成的配置文件（包含自动生成的 RPC 密钥），不要提交到仓库
+config.json
+
+# aria2 后台进程日志
+aria2-daemon.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 备份文件
+*.bak
+*.bak2
+*.old
