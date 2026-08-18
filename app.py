@@ -99,17 +99,21 @@ def normalize_repo_id(raw: str) -> str:
     return raw
 
 
-def hf_list_files(repo_id: str):
-    """调用 HF API 获取仓库文件列表（含文件大小）"""
-    url = f"https://huggingface.co/api/models/{repo_id}"
+def hf_list_files(repo_id: str, revision: str = "main"):
+    """调用 HF 的 tree API 获取仓库文件列表（这个接口会带上文件大小，
+    普通的 /api/models/{repo_id} 接口不带 size 字段）"""
+    url = f"https://huggingface.co/api/models/{repo_id}/tree/{revision}"
     resp = requests.get(url, timeout=20)
     resp.raise_for_status()
     data = resp.json()
-    siblings = data.get("siblings", [])
     files = []
-    for s in siblings:
-        name = s.get("rfilename")
-        size = s.get("size")  # 部分情况下 API 不返回 size，前端会显示"未知"
+    for item in data:
+        if item.get("type") != "file":
+            continue
+        name = item.get("path")
+        # 大文件走 LFS 存储，真实大小在 lfs.size 里；普通小文件用 size 字段
+        lfs = item.get("lfs") or {}
+        size = lfs.get("size", item.get("size"))
         if name:
             files.append({"name": name, "size": size})
     return files
@@ -304,7 +308,10 @@ INDEX_HTML = """
   <div class="row2">
     <div>
       <label>保存目录</label>
-      <input type="text" id="saveDir" value="{{ cfg.save_dir }}">
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="saveDir" value="{{ cfg.save_dir }}" style="flex:1;">
+        <button class="secondary" onclick="openBrowseModal()" style="white-space:nowrap;">浏览...</button>
+      </div>
     </div>
     <div>
       <label>单文件并发连接数（1-16）</label>
@@ -314,6 +321,21 @@ INDEX_HTML = """
   <div class="toolbar">
     <button onclick="submitDownload()">提交下载</button>
     <span id="submitStatus" class="muted"></span>
+  </div>
+</div>
+
+<!-- 目录浏览弹窗 -->
+<div id="browseModal" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.4); z-index:100;">
+  <div style="background:#fff; max-width:600px; margin:60px auto; border-radius:8px; padding:20px; max-height:70vh; display:flex; flex-direction:column;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+      <strong id="browseCurrentPath">/vol1</strong>
+      <span style="cursor:pointer; font-size:18px;" onclick="closeBrowseModal()">&times;</span>
+    </div>
+    <div id="browseList" style="overflow-y:auto; flex:1; border:1px solid #eee; border-radius:4px; padding:8px;"></div>
+    <div class="toolbar" style="margin-top:12px;">
+      <button onclick="selectCurrentBrowseDir()">选择当前目录</button>
+      <button class="secondary" onclick="closeBrowseModal()">取消</button>
+    </div>
   </div>
 </div>
 
@@ -473,6 +495,52 @@ async function refreshStatus() {
   }
 }
 
+let browseCurrentPath = '/vol1';
+
+async function openBrowseModal() {
+  document.getElementById('browseModal').style.display = 'block';
+  const startPath = document.getElementById('saveDir').value.trim() || '/vol1';
+  await loadBrowseDir(startPath);
+}
+
+function closeBrowseModal() {
+  document.getElementById('browseModal').style.display = 'none';
+}
+
+async function loadBrowseDir(path) {
+  try {
+    const res = await fetch('/api/browse?path=' + encodeURIComponent(path));
+    const data = await res.json();
+    if (data.error) {
+      // 路径无效时退回到根目录
+      if (path !== '/') { await loadBrowseDir('/'); return; }
+      document.getElementById('browseList').innerHTML = '<div class="muted">' + data.error + '</div>';
+      return;
+    }
+    browseCurrentPath = data.path;
+    document.getElementById('browseCurrentPath').textContent = data.path;
+    let html = '';
+    if (data.parent) {
+      html += `<div style="padding:6px; cursor:pointer; color:#2b7de9;" onclick="loadBrowseDir('${data.parent.replace(/'/g, "\\'")}')">.. (上一级)</div>`;
+    }
+    data.dirs.forEach(d => {
+      const full = (data.path.endsWith('/') ? data.path : data.path + '/') + d;
+      html += `<div style="padding:6px; cursor:pointer;" onclick="loadBrowseDir('${full.replace(/'/g, "\\'")}')">📁 ${d}</div>`;
+    });
+    if (!data.dirs.length && !data.parent) {
+      html += '<div class="muted" style="padding:6px;">（没有子目录）</div>';
+    }
+    document.getElementById('browseList').innerHTML = html;
+  } catch (e) {
+    document.getElementById('browseList').innerHTML = '<div class="muted">加载失败: ' + e + '</div>';
+  }
+}
+
+function selectCurrentBrowseDir() {
+  document.getElementById('saveDir').value = browseCurrentPath;
+  closeBrowseModal();
+}
+
 refreshStatus();
 setInterval(refreshStatus, 5000);
 </script>
@@ -561,6 +629,38 @@ def api_settings():
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/browse")
+def api_browse():
+    """
+    列出指定路径下的子目录，供前端"浏览目录"弹窗使用。
+    允许浏览整个文件系统（方便跳转到 /vol1、/vol2 等不同存储卷），
+    只屏蔽几个 Linux 系统虚拟目录，避免误选到无意义的路径。
+    """
+    BLOCKED_PREFIXES = ("/proc", "/sys", "/dev", "/run")
+
+    path = request.args.get("path", "/").strip() or "/"
+    path = os.path.normpath(path)
+
+    if any(path == p or path.startswith(p + "/") for p in BLOCKED_PREFIXES):
+        path = "/"
+
+    if not os.path.isdir(path):
+        return jsonify({"error": f"目录不存在: {path}"}), 400
+
+    try:
+        entries = []
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if os.path.isdir(full) and not name.startswith("."):
+                entries.append(name)
+        parent = os.path.dirname(path) if path != "/" else None
+        return jsonify({"path": path, "parent": parent, "dirs": entries})
+    except PermissionError:
+        return jsonify({"error": "没有权限访问该目录"}), 403
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
