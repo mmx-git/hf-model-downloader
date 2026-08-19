@@ -27,10 +27,12 @@
   systemctl restart hf-downloader
 """
 
+import atexit
 import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -43,6 +45,7 @@ app = Flask(__name__)
 # ========== 默认配置（也可以在网页"设置"里覆盖，会写入 config.json） ==========
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 ARIA2_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aria2-daemon.log")
+ARIA2_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aria2-daemon.pid")
 
 import platform
 
@@ -150,6 +153,59 @@ def hf_resolve_url(repo_id: str, filename: str, revision: str = "main", endpoint
 _aria2_daemon_process = None
 
 
+def _shutdown_aria2_daemon():
+    """
+    主程序退出时（无论是 Ctrl+C、关闭窗口、还是被systemctl stop），
+    主动结束我们自己拉起的 aria2c 子进程，避免留下孤儿进程占用带宽和端口。
+    这个函数会被注册到 atexit 和信号处理器里，双重保险。
+    """
+    global _aria2_daemon_process
+    if _aria2_daemon_process is not None and _aria2_daemon_process.poll() is None:
+        try:
+            _aria2_daemon_process.terminate()  # 先礼貌地发送终止信号，让 aria2c 有机会保存下载进度
+            _aria2_daemon_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _aria2_daemon_process.kill()  # 5 秒还没退出就强制杀掉
+        except Exception:
+            pass
+    try:
+        if os.path.exists(ARIA2_PID_FILE):
+            os.remove(ARIA2_PID_FILE)
+    except Exception:
+        pass
+
+
+def _cleanup_stale_aria2_from_previous_run():
+    """
+    程序启动时调用一次：如果上一次运行时（比如被强制关闭窗口、没走到正常退出流程）
+    残留了一个孤儿 aria2c 进程，这里把它杀掉，避免越攒越多、占用带宽和端口。
+    """
+    if not os.path.exists(ARIA2_PID_FILE):
+        return
+    try:
+        with open(ARIA2_PID_FILE, "r") as f:
+            old_pid = int(f.read().strip())
+        os.kill(old_pid, signal.SIGTERM)
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        pass  # 进程本来就不存在了，或者已经是别的无关进程占了这个 PID，忽略即可
+    finally:
+        try:
+            os.remove(ARIA2_PID_FILE)
+        except Exception:
+            pass
+
+
+def _handle_termination_signal(signum, frame):
+    """收到 Ctrl+C（SIGINT）或系统终止信号（SIGTERM）时，先清理子进程再退出"""
+    _shutdown_aria2_daemon()
+    sys.exit(0)
+
+
+atexit.register(_shutdown_aria2_daemon)
+signal.signal(signal.SIGINT, _handle_termination_signal)
+signal.signal(signal.SIGTERM, _handle_termination_signal)
+
+
 def _rpc_port_from_url(rpc_url: str) -> str:
     # 从 http://127.0.0.1:6801/jsonrpc 里提取端口号
     m = re.search(r':(\d+)/', rpc_url)
@@ -222,6 +278,11 @@ def ensure_aria2_daemon(cfg):
 
     try:
         _aria2_daemon_process = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            with open(ARIA2_PID_FILE, "w") as f:
+                f.write(str(_aria2_daemon_process.pid))
+        except Exception:
+            pass  # 写 PID 文件失败不影响主流程，只是下次启动少一层清理保险
     except FileNotFoundError:
         log_f.write(
             "\n[启动失败] 找不到 aria2c 可执行文件。\n"
@@ -541,14 +602,56 @@ function renderStatusGroup(title, tasks) {
   if (!tasks.length) return '';
   let html = `<div class="muted" style="margin-top:8px;">${title}</div>`;
   tasks.forEach(t => {
+    let buttons = '';
+    if (t.status === 'active') {
+      buttons = `
+        <button class="secondary" style="padding:3px 10px; font-size:12px;" onclick="pauseTask('${t.gid}')">暂停</button>
+        <button class="secondary" style="padding:3px 10px; font-size:12px;" onclick="cancelTask('${t.gid}')">取消</button>
+      `;
+    } else if (t.status === 'paused') {
+      buttons = `
+        <button class="secondary" style="padding:3px 10px; font-size:12px;" onclick="resumeTask('${t.gid}')">继续</button>
+        <button class="secondary" style="padding:3px 10px; font-size:12px;" onclick="cancelTask('${t.gid}')">取消</button>
+      `;
+    } else if (t.status === 'waiting') {
+      buttons = `<button class="secondary" style="padding:3px 10px; font-size:12px;" onclick="cancelTask('${t.gid}')">取消</button>`;
+    }
     html += `
       <div class="status-row">
-        <div>${t.name || '(未知文件名)'} — ${t.status} — ${(t.downloadSpeed/1024).toFixed(0)} KB/s — ${t.percent}%</div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span>${t.name || '(未知文件名)'} — ${t.status} — ${(t.downloadSpeed/1024).toFixed(0)} KB/s — ${t.percent}%</span>
+          <span style="display:flex; gap:6px;">${buttons}</span>
+        </div>
         <div class="bar-bg"><div class="bar-fg" style="width:${t.percent}%;"></div></div>
       </div>
     `;
   });
   return html;
+}
+
+async function pauseTask(gid) {
+  await fetch('/api/task/pause', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({gid})
+  });
+  refreshStatus();
+}
+
+async function resumeTask(gid) {
+  await fetch('/api/task/resume', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({gid})
+  });
+  refreshStatus();
+}
+
+async function cancelTask(gid) {
+  if (!confirm('确定要取消这个下载任务吗？已下载的部分不会被删除，下次可以重新提交继续下载。')) return;
+  await fetch('/api/task/cancel', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({gid})
+  });
+  refreshStatus();
 }
 
 async function refreshStatus() {
@@ -702,6 +805,53 @@ def api_status():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/task/pause", methods=["POST"])
+def api_task_pause():
+    data = request.get_json(force=True)
+    gid = data.get("gid", "").strip()
+    if not gid:
+        return jsonify({"ok": False, "error": "缺少 gid"}), 400
+    cfg = load_config()
+    try:
+        aria2_call("aria2.pause", [gid], cfg=cfg)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/task/resume", methods=["POST"])
+def api_task_resume():
+    data = request.get_json(force=True)
+    gid = data.get("gid", "").strip()
+    if not gid:
+        return jsonify({"ok": False, "error": "缺少 gid"}), 400
+    cfg = load_config()
+    try:
+        aria2_call("aria2.unpause", [gid], cfg=cfg)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/task/cancel", methods=["POST"])
+def api_task_cancel():
+    """
+    取消一个任务。注意：这里只是让 aria2 停止这个下载任务，
+    磁盘上已下载的部分和 .aria2 断点续传文件不会被删除——
+    如果之后想接着下同一个文件，重新提交同样的下载任务即可断点续传。
+    """
+    data = request.get_json(force=True)
+    gid = data.get("gid", "").strip()
+    if not gid:
+        return jsonify({"ok": False, "error": "缺少 gid"}), 400
+    cfg = load_config()
+    try:
+        aria2_call("aria2.forceRemove", [gid], cfg=cfg)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/settings", methods=["POST"])
 def api_settings():
     data = request.get_json(force=True)
@@ -773,6 +923,7 @@ def api_browse():
 
 
 if __name__ == "__main__":
+    _cleanup_stale_aria2_from_previous_run()
     _startup_cfg = ensure_secret(load_config())
     ensure_aria2_daemon(_startup_cfg)
 
