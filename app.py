@@ -59,6 +59,7 @@ DEFAULT_CONFIG = {
     "rpc_secret": "",  # 首次启动自动生成，不用手动填
     "save_dir": _default_save_dir(),
     "connections_per_file": 16,  # aria2 单文件最大连接数，1-16
+    "hf_endpoint": "https://huggingface.co",  # 留空或改成镜像站地址（如 https://hf-mirror.com）
 }
 
 
@@ -94,7 +95,8 @@ def normalize_repo_id(raw: str) -> str:
     """
     自动从各种输入格式里提取出 repo_id：
     - 纯 repo_id: "user/model"
-    - 完整链接: "https://huggingface.co/user/model/tree/main"
+    - 完整链接（官网或任意镜像站都行）: "https://huggingface.co/user/model/tree/main"
+      "https://hf-mirror.com/user/model/tree/main"
     - markdown 链接: "[user/model](https://huggingface.co/user/model/tree/main)"
     """
     raw = raw.strip()
@@ -102,18 +104,26 @@ def normalize_repo_id(raw: str) -> str:
     md_match = re.search(r'\]\((https?://[^\)]+)\)', raw)
     if md_match:
         raw = md_match.group(1)
-    # 完整 URL，提取 huggingface.co 后面的 user/model 部分
-    url_match = re.search(r'huggingface\.co/([^/\s]+/[^/\s\)\]]+)', raw)
-    if url_match:
-        return url_match.group(1)
+
+    # 完整 URL：不管是官网还是镜像站，只要是 http(s) 链接，
+    # 都提取域名后面路径的前两段（user/model），不写死域名
+    if raw.startswith("http://") or raw.startswith("https://"):
+        from urllib.parse import urlparse
+        parsed = urlparse(raw)
+        segments = [s for s in parsed.path.split("/") if s]
+        if len(segments) >= 2:
+            return f"{segments[0]}/{segments[1]}"
+        return raw
+
     # 已经是纯 repo_id 格式
     return raw
 
 
-def hf_list_files(repo_id: str, revision: str = "main"):
+def hf_list_files(repo_id: str, revision: str = "main", endpoint: str = "https://huggingface.co"):
     """调用 HF 的 tree API 获取仓库文件列表（这个接口会带上文件大小，
     普通的 /api/models/{repo_id} 接口不带 size 字段）"""
-    url = f"https://huggingface.co/api/models/{repo_id}/tree/{revision}"
+    endpoint = (endpoint or "https://huggingface.co").rstrip("/")
+    url = f"{endpoint}/api/models/{repo_id}/tree/{revision}"
     resp = requests.get(url, timeout=20)
     resp.raise_for_status()
     data = resp.json()
@@ -130,8 +140,9 @@ def hf_list_files(repo_id: str, revision: str = "main"):
     return files
 
 
-def hf_resolve_url(repo_id: str, filename: str, revision: str = "main"):
-    return f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+def hf_resolve_url(repo_id: str, filename: str, revision: str = "main", endpoint: str = "https://huggingface.co"):
+    endpoint = (endpoint or "https://huggingface.co").rstrip("/")
+    return f"{endpoint}/{repo_id}/resolve/{revision}/{filename}"
 
 
 # ========== aria2 RPC（本工具自己管理的独立 aria2c 进程，不用 Trim 的） ==========
@@ -336,6 +347,9 @@ INDEX_HTML = r"""
 <div class="card">
   <label>模型仓库 ID（如 JonathanColetti/Qwen3.8-27B-Uncensored-GGUF）</label>
   <input type="text" id="repoId" placeholder="用户名/仓库名">
+
+  <label style="margin-top:12px;">下载源地址（可选，留空默认用官网 huggingface.co；国外访问慢可以填国内镜像站，如 https://hf-mirror.com）</label>
+  <input type="text" id="hfEndpoint" value="{{ cfg.hf_endpoint }}" placeholder="https://huggingface.co">
   <div class="toolbar">
     <button onclick="loadFiles()">加载文件列表</button>
     <span id="loadStatus" class="muted"></span>
@@ -413,11 +427,23 @@ INDEX_HTML = r"""
 <script>
 let currentFiles = [];
 
+async function syncEndpoint() {
+  const endpoint = document.getElementById('hfEndpoint').value.trim();
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hf_endpoint: endpoint})
+    });
+  } catch (e) { /* 静默失败，不影响主流程 */ }
+}
+
 async function loadFiles() {
   const repoId = document.getElementById('repoId').value.trim();
   const statusEl = document.getElementById('loadStatus');
   if (!repoId) { statusEl.textContent = '请先输入仓库ID'; return; }
   statusEl.textContent = '正在加载...';
+  await syncEndpoint();
   try {
     const res = await fetch('/api/files?repo_id=' + encodeURIComponent(repoId));
     const data = await res.json();
@@ -474,6 +500,8 @@ async function submitDownload() {
     statusEl.textContent = '请先加载文件列表并勾选文件';
     return;
   }
+
+  await syncEndpoint();
 
   statusEl.textContent = '提交中...';
   try {
@@ -619,8 +647,9 @@ def api_files():
     repo_id = normalize_repo_id(repo_id)
     if not repo_id:
         return jsonify({"error": "缺少 repo_id"}), 400
+    cfg = load_config()
     try:
-        files = hf_list_files(repo_id)
+        files = hf_list_files(repo_id, endpoint=cfg.get("hf_endpoint"))
         return jsonify({"files": files})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -648,7 +677,7 @@ def api_download():
     errors = []
     for fname in files:
         try:
-            url = hf_resolve_url(repo_id, fname)
+            url = hf_resolve_url(repo_id, fname, endpoint=cfg.get("hf_endpoint"))
             # 文件名可能带子目录，out 参数保留原始相对路径，aria2 会自动建子目录
             aria2_add_download(url, save_dir, fname, connections, cfg=cfg)
             submitted += 1
@@ -681,6 +710,9 @@ def api_settings():
         cfg["rpc_url"] = data["rpc_url"]
     if "rpc_secret" in data:
         cfg["rpc_secret"] = data["rpc_secret"]
+    if "hf_endpoint" in data:
+        endpoint = (data["hf_endpoint"] or "").strip()
+        cfg["hf_endpoint"] = endpoint if endpoint else "https://huggingface.co"
     try:
         save_config(cfg)
         return jsonify({"ok": True})
