@@ -1,0 +1,16 @@
+services:
+  hf-model-downloader:
+    build: .
+    # 如果不想在飞牛本地构建镜像，也可以用 GitHub Actions 提前构建好推到 Docker Hub，
+    # 然后这里改成 image: mmx-git/hf-model-downloader:latest 直接拉取，跳过 build 这步
+    container_name: hf-model-downloader
+    ports:
+      - "5678:5678"
+    volumes:
+      # 左边改成你 NAS 上实际想存模型文件的目录，右边容器内路径跟 Dockerfile 里的一致，不要改
+      - /vol1/1000/download:/downloads
+      # 保存工具自身的配置文件（RPC 密钥等），避免容器重建后配置丢失
+      - ./hf-downloader-data:/app/data
+    environment:
+      - HF_DOWNLOADER_SAVE_DIR=/downloads
+    restart: unless-stopped

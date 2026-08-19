@@ -43,15 +43,31 @@ from flask import Flask, render_template_string, request, jsonify
 app = Flask(__name__)
 
 # ========== 默认配置（也可以在网页"设置"里覆盖，会写入 config.json） ==========
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-ARIA2_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aria2-daemon.log")
-ARIA2_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aria2-daemon.pid")
+# 配置、日志、PID 这些运行时生成的文件统一放进 data 子目录（跟主程序代码分开），
+# 方便 Docker 部署时单独挂载这个目录做持久化，不用整个 /app 目录都挂载
+_DATA_DIR = os.environ.get(
+    "HF_DOWNLOADER_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+)
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+CONFIG_FILE = os.path.join(_DATA_DIR, "config.json")
+ARIA2_LOG_FILE = os.path.join(_DATA_DIR, "aria2-daemon.log")
+ARIA2_PID_FILE = os.path.join(_DATA_DIR, "aria2-daemon.pid")
 
 import platform
 
 
 def _default_save_dir():
-    """跨平台默认保存目录：Windows 用用户的下载文件夹，Linux/NAS 用 /vol1"""
+    """
+    默认保存目录，优先级：
+    1. 环境变量 HF_DOWNLOADER_SAVE_DIR（Docker 容器部署时用这个指定挂载路径）
+    2. Windows：用户的"下载"文件夹
+    3. Linux/NAS：/vol1/1000/download
+    """
+    env_dir = os.environ.get("HF_DOWNLOADER_SAVE_DIR")
+    if env_dir:
+        return env_dir
     if platform.system() == "Windows":
         return os.path.join(os.path.expanduser("~"), "Downloads", "HF-Models")
     return "/vol1/1000/download"
@@ -197,13 +213,40 @@ def _cleanup_stale_aria2_from_previous_run():
 
 def _handle_termination_signal(signum, frame):
     """收到 Ctrl+C（SIGINT）或系统终止信号（SIGTERM）时，先清理子进程再退出"""
+    print(f"[启动诊断] 收到终止信号 signum={signum}，正在清理并退出", flush=True)
     _shutdown_aria2_daemon()
     sys.exit(0)
 
 
+def _is_running_in_docker() -> bool:
+    """
+    判断当前是不是跑在 Docker 容器里。
+    容器场景下不需要我们自己接管 SIGTERM——容器停止时，里面所有进程
+    （包括我们启动的 aria2c 子进程）会跟着容器一起被整体清理掉，不会留下孤儿进程，
+    这层保护反而可能在容器生命周期的某些阶段（比如刚创建、网络初始化）
+    被意外触发，导致容器"莫名其妙退出一次"。所以这里改成只信任 Docker 自己的
+    重启策略（如 docker-compose 里配的 restart: unless-stopped）。
+    """
+    if os.environ.get("RUNNING_IN_DOCKER") == "1":
+        return True
+    return os.path.exists("/.dockerenv")
+
+
 atexit.register(_shutdown_aria2_daemon)
-signal.signal(signal.SIGINT, _handle_termination_signal)
-signal.signal(signal.SIGTERM, _handle_termination_signal)
+_docker_env_var = os.environ.get("RUNNING_IN_DOCKER")
+_dockerenv_exists = os.path.exists("/.dockerenv")
+_in_docker = _is_running_in_docker()
+print(
+    f"[启动诊断] 容器环境检测结果: {_in_docker} "
+    f"(RUNNING_IN_DOCKER环境变量={_docker_env_var!r}, /.dockerenv存在={_dockerenv_exists})",
+    flush=True,
+)
+if not _in_docker:
+    signal.signal(signal.SIGINT, _handle_termination_signal)
+    signal.signal(signal.SIGTERM, _handle_termination_signal)
+    print("[启动诊断] 已注册 SIGINT/SIGTERM 信号处理器（非容器模式）", flush=True)
+else:
+    print("[启动诊断] 容器模式，跳过信号处理器注册，交给 Docker 自己管理生命周期", flush=True)
 
 
 def _rpc_port_from_url(rpc_url: str) -> str:
