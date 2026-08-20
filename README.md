@@ -2,6 +2,8 @@
 
 一个跑在群晖/飞牛等 NAS（或任意 Linux 主机）本地的轻量 Web 工具，用来批量下载 HuggingFace 仓库里的模型文件。
 
+<img width="90%" alt="工具界面截图" src="ff24493c-2d61-44ec-96f4-77bf331af0cb.png"/>
+
 ## 功能
 
 - 输入 HuggingFace 仓库 ID，或者直接粘贴仓库网址（完整链接 / markdown 链接格式都能自动识别）
